@@ -6,16 +6,17 @@ const dotenv = require("dotenv");
 const passport = require("passport");
 const session = require("express-session");
 const { Strategy: GoogleStrategy } = require("passport-google-oauth20");
-const { WebSocketServer } = require('ws');
-const MongoStore = require('connect-mongo');
+const { WebSocketServer } = require("ws");
+const MongoStore = require("connect-mongo");
 
 dotenv.config();
 
 const app = express();
 const wss = new WebSocketServer({ port: 8080 });
 
+// CORS Configuration
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || "http://localhost:3000",
+  origin: process.env.FRONTEND_URI || "http://localhost:3000",
   credentials: true
 }));
 
@@ -34,67 +35,95 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 // MongoDB Connection
-mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => console.log("MongoDB connected"))
-  .catch(err => console.error("MongoDB connection error:", err));
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB connected"))
+  .catch(err => console.error("❌ MongoDB connection error:", err));
 
+// User Schema
+const User = mongoose.model("User", new mongoose.Schema({
+  googleId: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true },
+  accessToken: String,
+  refreshToken: String,
+  historyId: String,  // Stores last checked email historyId
+  lastLogin: Date
+}));
+
+// Google Authentication
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: process.env.GOOGLE_CALLBACK_URL || "http://localhost:5000/api/auth/google/callback",
+  callbackURL: process.env.GOOGLE_CALLBACK_URL,
   passReqToCallback: true
-}, 
-async (req, accessToken, refreshToken, profile, done) => {
+}, async (req, accessToken, refreshToken, profile, done) => {
   try {
-    const db = mongoose.connection.db;
-    const user = await db.collection('users').findOneAndUpdate(
-      { googleId: profile.id },
-      {
-        $set: { 
-          accessToken,
-          refreshToken,
-          lastLogin: new Date(),
-          email: profile.emails[0].value
-        }
-      },
-      { upsert: true, returnDocument: 'after' }
-    );
+    let user = await User.findOne({ googleId: profile.id });
 
-    if (user.value) {
-      watchEmails(user.value._id, accessToken, refreshToken);
-      return done(null, user.value);
+    if (!user) {
+      user = new User({
+        googleId: profile.id,
+        email: profile.emails[0].value,
+        accessToken,
+        refreshToken,
+        lastLogin: new Date()
+      });
     } else {
-      return done(null, false);
+      user.accessToken = accessToken;
+      user.refreshToken = refreshToken;
+      user.lastLogin = new Date();
     }
+
+    await user.save();
+    watchEmails(user);
+    return done(null, user);
   } catch (error) {
     return done(error);
   }
 }));
 
-// Email Watch Function (Prevents Redundant Calls)
+// Refresh Access Token
+async function refreshAccessToken(user) {
+  try {
+    const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
+    auth.setCredentials({ refresh_token: user.refreshToken });
+
+    const { credentials } = await auth.refreshAccessToken();
+    user.accessToken = credentials.access_token;
+    await user.save();
+  } catch (err) {
+    console.error("Token refresh error:", err.message);
+  }
+}
+
+// Email Watch Function
 const activeUsers = new Set();
 
-async function watchEmails(userId, accessToken, refreshToken) {
-  if (activeUsers.has(userId.toString())) return;
-  activeUsers.add(userId.toString());
+async function watchEmails(user) {
+  if (activeUsers.has(user.googleId)) return;
+  activeUsers.add(user.googleId);
 
   const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-  auth.setCredentials({ access_token: accessToken });
+  auth.setCredentials({ access_token: user.accessToken });
 
   const gmail = google.gmail({ version: 'v1', auth });
-  let lastHistoryId = null;
+  let lastHistoryId = user.historyId || null;
 
   setInterval(async () => {
     try {
+      if (!user.accessToken) await refreshAccessToken(user);
+
       const res = await gmail.users.history.list({ userId: 'me', startHistoryId: lastHistoryId });
-      
+
       if (res.data.history) {
+        lastHistoryId = res.data.historyId;
+        user.historyId = lastHistoryId;
+        await user.save();
+
         wss.clients.forEach(client => {
-          if (client.readyState === WebSocket.OPEN && client.userId === userId.toString()) {
+          if (client.readyState === WebSocket.OPEN && client.userId === user.googleId) {
             client.send(JSON.stringify({ type: 'new-emails' }));
           }
         });
-        lastHistoryId = res.data.historyId;
       }
     } catch (error) {
       console.error('Email watch error:', error.message);
@@ -104,20 +133,22 @@ async function watchEmails(userId, accessToken, refreshToken) {
 
 // WebSocket Authentication
 wss.on('connection', (ws, req) => {
-  const userId = new URL(req.url, `http://${req.headers.host}`).searchParams.get("userId");
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const userId = url.searchParams.get("userId");
+
   if (!userId) {
     ws.close();
     return;
   }
+
   ws.userId = userId;
 });
 
-// Serialization / Deserialization
+// Passport Serialization
 passport.serializeUser((user, done) => done(null, user._id));
 passport.deserializeUser(async (id, done) => {
   try {
-    const db = mongoose.connection.db;
-    const user = await db.collection('users').findOne({ _id: new mongoose.Types.ObjectId(id) });
+    const user = await User.findById(id);
     done(null, user);
   } catch (err) {
     done(err);
@@ -140,7 +171,7 @@ app.get('/api/emails', async (req, res) => {
 
   try {
     const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-    auth.setCredentials({ access_token: req.user.accessToken, refresh_token: req.user.refreshToken });
+    auth.setCredentials({ access_token: req.user.accessToken });
 
     const gmail = google.gmail({ version: 'v1', auth });
     const response = await gmail.users.messages.list({ userId: 'me', maxResults: 10, labelIds: ['INBOX'] });
@@ -158,21 +189,9 @@ app.get('/api/emails', async (req, res) => {
 
     res.json(emails);
   } catch (error) {
-    console.error('Email fetch error:', error);
     res.status(500).json({ error: 'Failed to fetch emails' });
   }
 });
 
-app.get('/api/auth/logout', (req, res) => {
-  req.logout(err => {
-    if (err) return res.status(500).json({ error: 'Logout failed' });
-    req.session.destroy(err => {
-      if (err) console.error('Session destruction error:', err);
-      res.clearCookie('connect.sid');
-      res.redirect(process.env.FRONTEND_URI || 'http://localhost:3000');
-    });
-  });
-});
-
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
