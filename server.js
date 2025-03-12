@@ -21,6 +21,7 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
+app.options("*", cors()); // ✅ Preflight handling
 
 app.use(express.json());
 app.use(
@@ -30,7 +31,7 @@ app.use(
     saveUninitialized: false,
     store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
     cookie: { 
-      secure: process.env.NODE_ENV === 'production',
+      secure: process.env.NODE_ENV === 'production', 
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 1000 * 60 * 60 * 24 
     }
@@ -51,7 +52,7 @@ const User = mongoose.model("User", new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   accessToken: String,
   refreshToken: String,
-  historyId: String,  
+  historyId: String,
   lastLogin: Date
 }));
 
@@ -61,9 +62,9 @@ passport.use(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: process.env.GOOGLE_CALLBACK_URL,
+      callbackURL: process.env.GOOGLE_CALLBACK_URL || "http://localhost:5000/api/auth/google/callback",
       passReqToCallback: true,
-      state: true, // ✅ Added state for OAuth security
+      state: true,
     },
     async (req, accessToken, refreshToken, profile, done) => {
       try {
@@ -93,9 +94,8 @@ passport.use(
   )
 );
 
-// ✅ Email Watch Function
+// ✅ Watch Emails
 const activeUsers = new Set();
-
 async function watchEmails(user) {
   if (activeUsers.has(user.googleId)) return;
   activeUsers.add(user.googleId);
@@ -108,8 +108,6 @@ async function watchEmails(user) {
 
   setInterval(async () => {
     try {
-      if (!user.accessToken) await refreshAccessToken(user);
-
       const res = await gmail.users.history.list({ userId: 'me', startHistoryId: lastHistoryId });
 
       if (res.data.history) {
@@ -131,6 +129,7 @@ async function watchEmails(user) {
 
 // ✅ WebSocket Handling
 wss.on('connection', (ws, req) => {
+  console.log("✅ WebSocket Connected");
   const url = new URL(req.url, `http://${req.headers.host}`);
   const userId = url.searchParams.get("userId");
 
@@ -143,45 +142,19 @@ wss.on('connection', (ws, req) => {
 });
 
 // ✅ Routes
-app.get('/api/auth/google', (req, res, next) => {
-  console.log("✅ Google Auth Route Hit");
-  next();
-}, passport.authenticate('google', {
+app.get('/api/auth/google', passport.authenticate('google', {
   scope: ['email', 'profile', 'https://www.googleapis.com/auth/gmail.readonly'],
   accessType: 'offline',
   prompt: 'consent'
 }));
 
-app.get('/api/auth/google/callback', passport.authenticate('google', { failureRedirect: '/login' }), (req, res) => {
-  res.redirect(process.env.FRONTEND_URI || 'http://localhost:5173'); // ✅ Redirect to frontend
-});
+app.get('/api/auth/google/callback',
+  passport.authenticate('google', { failureRedirect: process.env.FRONTEND_URI + '/login' }),
+  (req, res) => res.redirect(process.env.FRONTEND_URI || 'http://localhost:5173')
+);
 
-
-app.get('/api/emails', async (req, res) => {
-  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-
-  try {
-    const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-    auth.setCredentials({ access_token: req.user.accessToken });
-
-    const gmail = google.gmail({ version: 'v1', auth });
-    const response = await gmail.users.messages.list({ userId: 'me', maxResults: 10, labelIds: ['INBOX'] });
-
-    const messages = response.data.messages || [];
-    const emails = await Promise.all(messages.map(async (msg) => {
-      const email = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'metadata' });
-      return {
-        id: email.data.id,
-        subject: email.data.payload.headers.find(h => h.name === 'Subject')?.value,
-        snippet: email.data.snippet,
-        date: email.data.payload.headers.find(h => h.name === 'Date')?.value
-      };
-    }));
-
-    res.json(emails);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch emails' });
-  }
+app.get('/login', (req, res) => {
+  res.redirect(process.env.FRONTEND_URI || 'http://localhost:5173/login');
 });
 
 // ✅ Passport Serialization
