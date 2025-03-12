@@ -153,8 +153,9 @@ app.get('/api/auth/google', (req, res, next) => {
 }));
 
 app.get('/api/auth/google/callback', passport.authenticate('google', { failureRedirect: '/login' }), (req, res) => {
-  res.redirect(process.env.FRONTEND_URI || 'http://localhost:5173');
+  res.redirect(process.env.FRONTEND_URI || 'http://localhost:5173'); // ✅ Redirect to frontend
 });
+
 
 app.get('/api/emails', async (req, res) => {
   if (!req.user) return res.status(401).json({ error: "Unauthorized" });
