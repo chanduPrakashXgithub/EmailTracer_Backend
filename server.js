@@ -37,9 +37,9 @@ app.use(
     saveUninitialized: false,
     store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
     cookie: {
-      secure: process.env.NODE_ENV === "production",
+      secure: process.env.NODE_ENV === "production", // ✅ Use secure cookies in production
       sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-      maxAge: 1000 * 60 * 60 * 24, // 1 day
+      maxAge: 1000 * 60 * 60 * 24, // ✅ 1 day
     },
   })
 );
@@ -73,8 +73,7 @@ passport.use(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL:
-        "https://emailtracer-backend.onrender.com/api/auth/google/callback", // ✅ Correct URL
+      callbackURL: `${process.env.BACKEND_URI}/api/auth/google/callback`, // ✅ Dynamic Callback URL
       passReqToCallback: true,
       state: true,
     },
@@ -105,6 +104,17 @@ passport.use(
     }
   )
 );
+
+// ✅ Passport Serialization
+passport.serializeUser((user, done) => done(null, user._id));
+passport.deserializeUser(async (id, done) => {
+  try {
+    const user = await User.findById(id);
+    done(null, user);
+  } catch (err) {
+    done(err);
+  }
+});
 
 // ✅ Token Refresh Function
 async function refreshAccessToken(user) {
@@ -198,7 +208,7 @@ app.get(
 
 app.get(
   "/api/auth/google/callback",
-  passport.authenticate("google", { failureRedirect: process.env.FRONTEND_URI + "/login" }),
+  passport.authenticate("google", { failureRedirect: `${process.env.FRONTEND_URI}/login` }),
   (req, res) => {
     res.redirect(process.env.FRONTEND_URI || "http://localhost:5173");
   }
@@ -211,10 +221,7 @@ app.get("/api/emails", async (req, res) => {
   }
 
   try {
-    if (!req.user.accessToken) {
-      console.log("❌ No access token found, trying to refresh...");
-      await refreshAccessToken(req.user);
-    }
+    if (!req.user.accessToken) await refreshAccessToken(req.user);
 
     const auth = new google.auth.OAuth2(
       process.env.GOOGLE_CLIENT_ID,
@@ -228,9 +235,8 @@ app.get("/api/emails", async (req, res) => {
       maxResults: 10,
     });
 
-    const messages = response.data.messages || [];
     const emails = await Promise.all(
-      messages.map(async (msg) => {
+      response.data.messages.map(async (msg) => {
         const email = await gmail.users.messages.get({ userId: "me", id: msg.id });
         return {
           id: email.data.id,
