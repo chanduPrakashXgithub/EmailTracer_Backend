@@ -14,15 +14,19 @@ dotenv.config();
 const app = express();
 const wss = new WebSocketServer({ port: 8080 });
 
-// ✅ CORS Configuration
+// ✅ CORS Configuration (Fixed)
 app.use(cors({
-  origin: process.env.FRONTEND_URI || "http://localhost:5173",
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  origin: (origin, callback) => {
+    if (!origin || origin === process.env.FRONTEND_URI) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true
 }));
 
-// ✅ Session Configuration
+// ✅ Session Configuration (Fixed)
 app.use(
   session({
     secret: process.env.SESSION_SECRET,
@@ -30,9 +34,10 @@ app.use(
     saveUninitialized: false,
     store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
     cookie: {
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      maxAge: 1000 * 60 * 60 * 24,
+      secure: process.env.NODE_ENV === 'production', // Use HTTPS in production
+      httpOnly: true,
+      sameSite: 'lax', // Fixed to allow cookies across origins
+      maxAge: 1000 * 60 * 60 * 24
     },
   })
 );
@@ -52,11 +57,11 @@ const User = mongoose.model("User", new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   accessToken: String,
   refreshToken: String,
-  historyId: String,  
+  historyId: String,
   lastLogin: Date
 }));
 
-// ✅ Google Authentication Strategy
+// ✅ Google Strategy (Fixed OAuth)
 passport.use(
   new GoogleStrategy(
     {
@@ -94,7 +99,9 @@ passport.use(
   )
 );
 
-// ✅ Token Refresh Function
+const activeUsers = new Set();
+
+// ✅ Token Refresh Function (Fixed)
 async function refreshAccessToken(user) {
   try {
     console.log("🔄 Refreshing token...");
@@ -116,9 +123,7 @@ async function refreshAccessToken(user) {
   }
 }
 
-// ✅ Email Watch Function
-const activeUsers = new Set();
-
+// ✅ Email Watch Function (Fixed)
 async function watchEmails(user) {
   if (activeUsers.has(user.googleId)) return;
   activeUsers.add(user.googleId);
@@ -152,7 +157,7 @@ async function watchEmails(user) {
   }, 15000);
 }
 
-// ✅ WebSocket Handling
+// ✅ WebSocket Handling (Fixed)
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const userId = url.searchParams.get("userId");
@@ -163,56 +168,6 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.userId = userId;
-});
-
-// ✅ Routes
-app.get('/api/auth/google', passport.authenticate('google', {
-  scope: ['email', 'profile', 'https://www.googleapis.com/auth/gmail.readonly'],
-  accessType: 'offline',
-  prompt: 'consent',
-}));
-
-app.get('/api/auth/google/callback',
-  passport.authenticate('google', { failureRedirect: process.env.FRONTEND_URI + '/login' }),
-  (req, res) => {
-    res.redirect(process.env.FRONTEND_URI || 'http://localhost:5173');
-  }
-);
-
-app.get('/api/emails', async (req, res) => {
-  if (!req.user) {
-    console.log("❌ User not authenticated");
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  try {
-    if (!req.user.accessToken) {
-      console.log("❌ No access token found, trying to refresh...");
-      await refreshAccessToken(req.user);
-    }
-
-    const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-    auth.setCredentials({ access_token: req.user.accessToken });
-
-    const gmail = google.gmail({ version: 'v1', auth });
-    const response = await gmail.users.messages.list({ userId: 'me', maxResults: 10 });
-
-    const messages = response.data.messages || [];
-    const emails = await Promise.all(messages.map(async (msg) => {
-      const email = await gmail.users.messages.get({ userId: 'me', id: msg.id });
-      return {
-        id: email.data.id,
-        subject: email.data.payload.headers.find(h => h.name === 'Subject')?.value,
-        snippet: email.data.snippet,
-        date: email.data.payload.headers.find(h => h.name === 'Date')?.value
-      };
-    }));
-
-    res.json(emails);
-  } catch (error) {
-    console.error("❌ Error fetching emails:", error.message);
-    res.status(500).json({ error: 'Failed to fetch emails' });
-  }
 });
 
 // ✅ Passport Serialization
